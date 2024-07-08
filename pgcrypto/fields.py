@@ -294,3 +294,124 @@ for lookup_name in ("exact", "gt", "gte", "lt", "lte"):
     BaseEncryptedField.register_lookup(lookup_class)
 
 BaseEncryptedField.register_lookup(EncryptedInLookup)
+
+
+class EncryptedCustomTextField(models.TextField):
+    description = _("Text")
+    coalesce = "''"
+    field_cast = ""
+
+    def __init__(self, *args, **kwargs):
+        self.cipher_name = kwargs.pop(
+            "cipher", getattr(settings, "PGCRYPTO_DEFAULT_CIPHER", "aes")
+        ).lower()
+        if self.cipher_name != "aes":
+            raise ValueError("Cipher must be `aes` (got `{}`)".format(self.cipher_name))
+        self.cipher_key = kwargs.pop(
+            "key", getattr(settings, "PGCRYPTO_DEFAULT_KEY", settings.SECRET_KEY)
+        )
+        self.charset = kwargs.pop("charset", "utf-8")
+        if isinstance(self.cipher_key, str):
+            self.cipher_key = self.cipher_key.encode(self.charset)
+        if self.cipher_name == "aes":
+            self.cipher_key = aes_pad_key(self.cipher_key)
+        self.check_armor = kwargs.pop("check_armor", True)
+        self.versioned = kwargs.pop("versioned", False)
+        super().__init__(*args, **kwargs)
+
+    def formfield(self, **kwargs):
+        defaults = {"widget": forms.Textarea}
+        defaults.update(kwargs)
+        return super().formfield(**defaults)
+
+    def set_cipher_key(self, key):
+        self.cipher_key = key.encode(self.charset)
+        self.cipher_key = aes_pad_key(self.cipher_key)
+
+    def get_internal_type(self):
+        return "TextField"
+
+    def deconstruct(self):
+        """
+        Deconstruct the field for Django 1.7+ migrations.
+        """
+        name, path, args, kwargs = super().deconstruct()
+        kwargs.update(
+            {
+                "cipher": self.cipher_name,
+                "charset": self.charset,
+                "check_armor": self.check_armor,
+                "versioned": self.versioned,
+            }
+        )
+        return name, path, args, kwargs
+
+    @property
+    def algorithm(self):
+        return {"aes": algorithms.AES}[self.cipher_name]
+
+    @property
+    def block_size(self):
+        return self.algorithm.block_size // 8
+
+    def get_cipher(self):
+        """
+        Return a new Cipher object for each time we want to encrypt/decrypt. This is
+        because pgcrypto expects a zeroed block for IV (initial value), but the IV on
+        the cipher object is cumulatively updated each time encrypt/decrypt is called.
+        """
+        return Cipher(
+            self.algorithm(self.cipher_key),
+            modes.CBC(b"\0" * self.block_size),
+            backend=default_backend(),
+        )
+
+    def encrypt(self, data):
+        context = self.get_cipher().encryptor()
+        return context.update(data) + context.finalize()
+
+    def decrypt(self, data):
+        context = self.get_cipher().decryptor()
+        return context.update(data) + context.finalize()
+
+    def is_encrypted(self, value):
+        """
+        Returns whether the given value is encrypted (and armored) or not.
+        """
+        return isinstance(value, str) and value.startswith("-----BEGIN")
+
+    def to_python(self, value, cipher_key=None):
+        if self.is_encrypted(value):
+            # If we have an encrypted (armored, really) value, do the following when
+            # accessing it as a python value:
+            #    1. De-armor the value to get an encrypted bytestring.
+            #    2. Decrypt the bytestring using the specified cipher.
+            #    3. Unpad the bytestring using the cipher's block size.
+            #    4. Decode to a unicode string using the specified charset.
+            self.set_cipher_key(cipher_key)
+            return unpad(
+                self.decrypt(dearmor(value, verify=self.check_armor)), self.block_size
+            ).decode(self.charset)
+        return value
+
+    def from_db_value(self, value, expression, connection):
+        return self.to_python(value)
+
+    def get_db_prep_save(self, value, connection, cipher_key=None):
+        #and not self.cipher_key starts_with(settings.SECRET_KEY)
+        if value and not self.is_encrypted(value):
+            # If we have a value and it's not encrypted, do the following before storing
+            # in the database:
+            #    1. Convert it to a unicode string (by calling unicode).
+            #    2. Encode the unicode string according to the specified charset.
+            #    3. Pad the bytestring for encryption, using the cipher's block size.
+            #    4. Encrypt the padded bytestring using the specified cipher.
+            #    5. Armor the encrypted bytestring for storage in the text field.
+            self.set_cipher_key(cipher_key)
+            return armor(
+                self.encrypt(
+                    pad(force_str(value).encode(self.charset), self.block_size)
+                ),
+                versioned=self.versioned,
+            )
+        return value
