@@ -42,8 +42,6 @@ if has_django:
         EncryptedTextField,
     )
 
-    from .metaclass import PIIModel
-
     __all__ += [
         "EncryptedCharField",
         "EncryptedDateField",
