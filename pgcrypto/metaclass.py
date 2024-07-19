@@ -1,6 +1,6 @@
 from django.db import models
 
-from pgcrypto.fields import EncryptedCustomTextField
+from .fields import EncryptedCustomTextField
 
 
 class PIIModel(models.Model):
